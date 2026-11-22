@@ -1,0 +1,60 @@
+# Official MinIO chart 5.4.0, single instance (adapted from minio-a in
+# github.com/rmmbdev/demo-iceberg-polaris-multi-catalog-minio).
+mode: standalone
+replicas: 1
+
+# MinIO no longer publishes community images on quay.io / Docker Hub, so we
+# use Chainguard's build. Its free tier only offers `:latest`, so README step 2
+# pulls it by digest and retags it locally with the MinIO release it contains.
+# The same image serves as mcImage: it ships `mc` plus the /bin/sh, cat, head,
+# sleep, ... that the chart's post-install jobs need (the separate
+# chainguard/minio-client image has no shell).
+image:
+  repository: cgr.dev/chainguard/minio
+  tag: RELEASE.2026-11-16T00-11-40Z
+  pullPolicy: IfNotPresent
+mcImage:
+  repository: cgr.dev/chainguard/minio
+  tag: RELEASE.2026-11-16T00-11-40Z
+  pullPolicy: IfNotPresent
+
+existingSecret: minio-root          # keys: rootUser / rootPassword
+
+persistence:
+  enabled: true
+  size: 20Gi
+
+resources:
+  requests:
+    memory: 512Mi
+
+# Fixed NodePorts on the static minikube IP: the same address works from
+# the laptop and from pods (Spark drivers and executors).
+service:
+  type: NodePort
+  nodePort: 30900
+consoleService:
+  type: NodePort
+  nodePort: 30901
+
+buckets:
+  - name: warehouse
+    policy: none
+    purge: false
+
+# STS AssumeRole credentials inherit this bucket-scoped policy.
+policies:
+  - name: warehouse-rw
+    statements:
+      - resources:
+          - 'arn:aws:s3:::warehouse'
+          - 'arn:aws:s3:::warehouse/*'
+        actions:
+          - "s3:*"
+
+# The identity Polaris uses to call AssumeRole for the `lakehouse` catalog.
+users:
+  - accessKey: lake-user
+    existingSecret: lake-user-secrets
+    existingSecretKey: secretKey
+    policy: warehouse-rw

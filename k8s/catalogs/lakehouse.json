@@ -1,0 +1,23 @@
+{
+  "catalog": {
+    "name": "lakehouse",
+    "type": "INTERNAL",
+    "properties": {
+      "default-base-location": "s3://warehouse/"
+    },
+    "storageConfigInfo": {
+      "storageType": "S3",
+      "storageName": "lake",
+      "roleArn": "arn:aws:iam::000000000000:role/minio-ignored",
+      "region": "us-east-1",
+      "allowedLocations": [
+        "s3://warehouse/"
+      ],
+      "endpoint": "http://192.168.49.2:30900",
+      "endpointInternal": "http://minio:9000",
+      "stsEndpoint": "http://minio:9000",
+      "pathStyleAccess": true,
+      "kmsUnavailable": true
+    }
+  }
+}

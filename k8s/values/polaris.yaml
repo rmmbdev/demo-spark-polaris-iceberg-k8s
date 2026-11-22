@@ -1,0 +1,53 @@
+# Apache Polaris chart 1.9.0. Only the values that differ from the chart
+# defaults. Adapted from github.com/rmmbdev/demo-iceberg-polaris-multi-catalog-minio
+# (Polaris 1.5.0, two catalogs) to Polaris 1.9.0 and one catalog.
+image:
+  tag: "1.9.0"
+
+service:
+  type: NodePort
+  ports:
+    - name: polaris-http
+      port: 8181
+      nodePort: 30181
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 768Mi
+  limits:
+    memory: 1536Mi
+
+extraEnv:
+  - name: AWS_REGION
+    value: "us-east-1"
+  # Credentials for storageName "lake": Polaris calls STS AssumeRole as
+  # this MinIO user and vends the short-lived result.
+  - name: polaris.storage.aws.lake.access-key
+    valueFrom:
+      secretKeyRef: { name: lake-user-secrets, key: accessKey }
+  - name: polaris.storage.aws.lake.secret-key
+    valueFrom:
+      secretKeyRef: { name: lake-user-secrets, key: secretKey }
+
+realmContext:
+  realms:
+    - POLARIS
+
+features:
+  SUPPORTED_CATALOG_STORAGE_TYPES:
+    - S3
+  DROP_WITH_PURGE_ENABLED: true
+  RESOLVE_CREDENTIALS_BY_STORAGE_NAME: true
+
+persistence:
+  type: relational-jdbc
+  relationalJdbc:
+    secret:
+      name: polaris-db-secrets       # keys: username / password / jdbcUrl
+
+storage:
+  secret:
+    name: minio-root
+    awsAccessKeyId: rootUser
+    awsSecretAccessKey: rootPassword

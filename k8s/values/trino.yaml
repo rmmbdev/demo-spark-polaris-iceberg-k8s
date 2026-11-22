@@ -1,0 +1,45 @@
+# Official Trino chart 1.45.0 (Trino 484). Small: 1 coordinator + 1 worker.
+server:
+  workers: 1
+
+service:
+  type: NodePort
+  nodePort: 30808
+
+coordinator:
+  jvm:
+    maxHeapSize: "1G"
+  resources:
+    requests: { memory: 1536Mi }
+    limits: { memory: 1536Mi }
+
+worker:
+  jvm:
+    maxHeapSize: "1G"
+  resources:
+    requests: { memory: 1536Mi }
+    limits: { memory: 1536Mi }
+
+envFrom:
+  - secretRef:
+      name: trino-secrets             # POLARIS_AUTH, S3_ACCESS_KEY, S3_SECRET_KEY
+
+# Named `lake`, like the Spark catalog, so lake.silver.quotes_daily means the
+# same table in both engines.
+catalogs:
+  lake: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://polaris:8181/api/catalog
+    iceberg.rest-catalog.warehouse=lakehouse
+    iceberg.rest-catalog.vended-credentials-enabled=false
+    iceberg.rest-catalog.security=OAUTH2
+    iceberg.rest-catalog.oauth2.credential=${ENV:POLARIS_AUTH}
+    iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+    iceberg.rest-catalog.oauth2.server-uri=http://polaris:8181/api/catalog/v1/oauth/tokens
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio:9000
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:S3_ACCESS_KEY}
+    s3.aws-secret-key=${ENV:S3_SECRET_KEY}
+    s3.region=us-east-1
