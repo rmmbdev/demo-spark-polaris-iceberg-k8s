@@ -1,0 +1,14 @@
+.idea/
+.venv/
+tmp/
+logs/
+*.log
+out/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Polaris principal secrets (clientId:clientSecret), created in step 6
+k8s/secrets/*.credential
+# Downloaded in README step 8
+jobs/jars/
