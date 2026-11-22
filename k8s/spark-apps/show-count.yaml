@@ -1,0 +1,55 @@
+# Template: scripts/submit.sh fills ${RUN_NAME}, ${IMAGE}, ${DRIVER_ARGS}.
+# Bronze: synthetic source data. No retries: rerun it by hand if needed.
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: ${RUN_NAME}
+  labels:
+    app.kubernetes.io/part-of: lakehouse-jobs
+    lakehouse/job: show-count
+spec:
+  pyFiles: "local:///opt/spark/app/lakehouse/jobs/show_count.py"
+  driverArgs: ${DRIVER_ARGS}
+  runtimeVersions:
+    sparkVersion: "4.1.4"
+    scalaVersion: "2.13"
+    jdkVersion: "17"
+  applicationTolerations:
+    restartConfig:
+      restartPolicy: Never
+    applicationTimeoutConfig:
+      # Can't get a driver pod scheduled in 5 min -> fail, don't hang.
+      driverStartTimeoutMillis: 300000
+    # Keep finished pods for `kubectl logs`; delete the whole run after 1 day.
+    resourceRetainPolicy: Always
+    ttlAfterStopMillis: 86400000
+  sparkConf:
+    # --- image and identity
+    spark.kubernetes.container.image: "${IMAGE}"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    spark.kubernetes.driver.secretKeyRef.POLARIS_CREDENTIAL: "spark-job-polaris:credential"
+    spark.redaction.regex: "(?i)secret|password|token|access[.]?key|credential"
+    # --- sizing for an 8 GB minikube: 1 driver + 1 executor
+    spark.driver.memory: "1g"
+    spark.driver.cores: "1"
+    spark.kubernetes.driver.request.cores: "500m"
+    spark.executor.instances: "1"
+    spark.executor.memory: "1g"
+    spark.executor.cores: "1"
+    spark.kubernetes.executor.request.cores: "500m"
+    spark.sql.shuffle.partitions: "8"
+    spark.sql.session.timeZone: "UTC"
+    # --- Iceberg catalog `lake` -> Polaris catalog `lakehouse` (in-cluster)
+    spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+    spark.sql.catalog.lake: "org.apache.iceberg.spark.SparkCatalog"
+    spark.sql.catalog.lake.type: "rest"
+    spark.sql.catalog.lake.uri: "http://polaris:8181/api/catalog"
+    spark.sql.catalog.lake.warehouse: "lakehouse"
+    spark.sql.catalog.lake.scope: "PRINCIPAL_ROLE:ALL"
+    spark.sql.catalog.lake.token-refresh-enabled: "true"
+    spark.sql.catalog.lake.header.X-Iceberg-Access-Delegation: "vended-credentials"
+    spark.sql.catalog.lake.io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+    spark.sql.catalog.lake.s3.endpoint: "http://minio:9000"
+    spark.sql.catalog.lake.s3.path-style-access: "true"
+    spark.sql.catalog.lake.client.region: "us-east-1"

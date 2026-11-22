@@ -1,0 +1,14 @@
+# Apache Spark Kubernetes Operator 1.1.0 = Helm chart 1.9.0
+# (chart version != operator version: `--version 1.1.0` would install 0.3.0).
+# Only overrides. The default operator pod asks for 1 CPU and 2 GiB,
+# too much for an 8 GB minikube.
+operatorDeployment:
+  operatorPod:
+    operatorContainer:
+      resources:
+        requests:
+          cpu: 250m
+          memory: 1Gi
+        limits:
+          cpu: "1"
+          memory: 1Gi
