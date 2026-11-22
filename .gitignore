@@ -12,3 +12,6 @@ __pycache__/
 k8s/secrets/*.credential
 # Downloaded in README step 8
 jobs/jars/
+
+# Jupyter autosave copies
+.ipynb_checkpoints/

@@ -1,0 +1,17 @@
+[project]
+name = "demo-spark-polaris-iceberg-k8s"
+version = "0.1.0"
+description = "Jupyter client for the demo: queries the lakehouse through the in-cluster Spark Connect server"
+readme = "README.md"
+authors = [
+    { name = "Reza Mohammadi", email = "rmm.dev.backend@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "jupyterlab>=4.6.6",
+    "pyspark-client==4.1.4",
+]
+
+[tool.uv]
+# Only the notebook's dependencies: no package of our own to build or install.
+package = false

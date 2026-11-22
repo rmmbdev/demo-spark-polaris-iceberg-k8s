@@ -14,6 +14,7 @@ short-lived MinIO credentials through MinIO's STS `AssumeRole`.
 | `spark-operator` | Apache Spark Kubernetes Operator **1.1.0** (Helm chart 1.9.0), CRD `spark.apache.org/v1` |
 | `spark-jobs` image | `apache/spark:4.1.4` + Iceberg 1.12.0 JARs + the job code in `jobs/src` |
 | `trino` | optional: official Trino chart 1.45.0 (Trino 484), to read the same tables from a second engine |
+| `spark-connect` | optional: a long-running `SparkApplication` serving Spark Connect, for Jupyter notebooks |
 
 ## Prerequisites
 
@@ -25,7 +26,8 @@ short-lived MinIO credentials through MinIO's STS `AssumeRole`.
 | `jq` | read Polaris API responses (steps 6, 10, 11) |
 | `envsubst` (package `gettext`), `python3` | used by `scripts/submit.sh` |
 | `curl` | download the Iceberg JARs, call Polaris |
-| Java 17 | only for the unit tests on the laptop (step 12) |
+| Java 17 | only for the unit tests on the laptop (step 13) |
+| `uv` | only for the notebook (step 12): installs `pyspark-client` and `jupyterlab` from `pyproject.toml` |
 
 The Polaris + MinIO part is adapted from
 [demo-iceberg-polaris-multi-catalog-minio](https://github.com/rmmbdev/demo-iceberg-polaris-multi-catalog-minio),
@@ -93,6 +95,7 @@ k8s/
   catalogs/     lakehouse.json             → Polaris catalog definition
   spark-apps/   generate-quotes.yaml  quotes-daily.yaml  maintenance.yaml
                                            → SparkApplication templates
+  connect/      spark-connect.yaml         → Spark Connect server + NodePort Service
 jobs/
   Dockerfile    the one image for all jobs
   src/lakehouse/
@@ -102,6 +105,8 @@ jobs/
   tests/        pytest, no cluster needed
 scripts/
   submit.sh     render a template, create the run, wait for the result
+notebooks/
+  sample.ipynb  Spark Connect client: query the lakehouse from Jupyter
 ```
 
 Configuration is split the production way:
@@ -125,6 +130,7 @@ from pods. Polaris itself uses `endpointInternal` (`http://minio:9000`).
 | MinIO S3 API | `http://minio:9000` | `http://192.168.49.2:30900` |
 | MinIO console | | `http://192.168.49.2:30901` (`minioadmin` / `minioadmin`) |
 | Trino (optional) | `http://trino:8080` | `http://192.168.49.2:30808` |
+| Spark Connect (optional) | `sc://spark-connect:15002` | `sc://192.168.49.2:31502` |
 | Spark UI of a running driver | | `kubectl port-forward` (step 10) |
 
 ## Memory (8 GB minikube)
@@ -135,6 +141,7 @@ from pods. Polaris itself uses `endpointInternal` (`http://minio:9000`).
 | spark-operator | 1 GB |
 | One job run: driver + 1 executor (1g heap + overhead each) | ~2.8 GB |
 | Trino (optional) | ~3 GB, so scale it to 0 before running jobs |
+| Spark Connect server (optional): driver + 1 executor, always on | ~2.8 GB, so delete it before running jobs |
 
 ---
 
@@ -560,7 +567,72 @@ first.
 
 Same rows Spark wrote: two engines, one catalog, no copy.
 
-## 12. Unit tests (on the laptop, no cluster)
+## 12. Optional: Jupyter over Spark Connect
+
+The jobs above are batch runs: the driver exits and the pods go away. A notebook
+needs a Spark session that **stays up**. Spark 4 ships **Spark Connect**, a
+client-server protocol: a long-running driver serves gRPC on port `15002`, and
+the notebook is a thin client (no JVM, no JARs on the laptop). The server is
+just another `SparkApplication`, so the operator runs it, and it gets the
+Polaris credential from the same Secret as the jobs. Notebooks never see it.
+
+The server's launcher (`lakehouse/jobs/connect_server.py`) is in the image, so
+build a new tag first (step 8):
+
+```bash
+  minikube image build -t spark-jobs:0.2 jobs
+```
+
+It needs the same memory as a job run. Don't run both at once on 8 GB: scale
+Trino to 0, and delete the server before `submit.sh` runs.
+
+```bash
+  IMAGE=spark-jobs:0.2 envsubst '${IMAGE}' < k8s/connect/spark-connect.yaml | kubectl apply -f -
+```
+
+Wait for `RunningHealthy` (Ctrl+C to stop watching), then check the log line:
+
+```bash
+  kubectl get sparkapp spark-connect -w
+```
+
+```bash
+  kubectl logs -l lakehouse/role=connect-server,spark-role=driver --tail=50 | grep "Spark Connect server listening"
+```
+
+The client on the laptop is the root `pyproject.toml`, managed with
+[uv](https://docs.astral.sh/uv/). It pins `pyspark-client==4.1.4`, which must
+match the server's Spark version, and `jupyterlab`. `uv sync` creates `.venv`
+with the Python in `.python-version` (3.13) and installs the locked versions
+from `uv.lock`:
+
+```bash
+  uv sync
+```
+
+```bash
+  uv run jupyter lab notebooks/sample.ipynb
+```
+
+The notebook connects with `SparkSession.builder.remote("sc://192.168.49.2:31502")`,
+lists the catalog, queries `lake.silver.quotes_daily` with SQL and the
+DataFrame API, reads Iceberg's `snapshots` metadata table, and hands a small
+result to pandas. `spark.stop()` in the notebook closes only that client
+session.
+
+Python UDFs from the notebook run in the executors' Python (3.10 in
+`apache/spark:4.1.4`), so they fail from the notebook's Python 3.13. SQL and
+DataFrame code is unaffected.
+
+The operator doesn't roll a running app when its spec changes. To change the
+server (a new image tag, more memory), delete it and apply again. Delete it
+when you're done, to free the memory:
+
+```bash
+  kubectl delete sparkapp spark-connect
+```
+
+## 13. Unit tests (on the laptop, no cluster)
 
 Needs Java 17 and Python 3.10+. Spark 4.1 doesn't run on newer JDKs such as
 Java 25; install 17 next to it (Manjaro/Arch: `sudo pacman -S jdk17-openjdk`)
@@ -602,6 +674,10 @@ The jobs only wire them to reads and writes.
 | `ModuleNotFoundError: lakehouse` in the driver log | Image built from an old Dockerfile; rebuild with a new tag (step 8) |
 | `submit.sh`: `envsubst: command not found` | Install `gettext` |
 | Code change has no effect | Image tag reused with `IfNotPresent`: build a new tag and pass `TAG=` |
+| Notebook: `failed to connect to all addresses` | Server not `RunningHealthy` yet, or the Service has no endpoint: `kubectl get endpoints spark-connect` |
+| Notebook: version mismatch errors | `pyspark-client` version differs from the server (4.1.4) |
+| `spark-connect` driver exits: `No module named ...connect_server` | Image built before step 12: build a new tag and apply with it |
+| Jobs stuck in `Submitted` while the server runs | Not enough memory for both: `kubectl delete sparkapp spark-connect` |
 
 ## Teardown
 

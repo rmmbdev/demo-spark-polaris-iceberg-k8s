@@ -1,0 +1,82 @@
+# Long-running Spark Connect server for notebooks (README step 12).
+# Not a submit.sh template: one fixed-name server, created with
+#   IMAGE=spark-jobs:<tag> envsubst '${IMAGE}' < k8s/connect/spark-connect.yaml | kubectl apply -f -
+# The operator doesn't roll a running app on spec changes: to change it,
+# `kubectl delete sparkapp spark-connect` and apply again.
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: spark-connect
+  labels:
+    app.kubernetes.io/part-of: lakehouse-jobs
+    lakehouse/job: spark-connect
+spec:
+  pyFiles: "local:///opt/spark/app/lakehouse/jobs/connect_server.py"
+  runtimeVersions:
+    sparkVersion: "4.1.4"
+    scalaVersion: "2.13"
+    jdkVersion: "17"
+  applicationTolerations:
+    restartConfig:
+      # A server should come back if the driver dies.
+      restartPolicy: OnFailure
+      maxRestartAttempts: 3
+      restartBackoffMillis: 30000
+    applicationTimeoutConfig:
+      driverStartTimeoutMillis: 300000
+    # Keep a failed driver for `kubectl logs`.
+    resourceRetainPolicy: OnFailure
+  sparkConf:
+    # --- image and identity
+    spark.kubernetes.container.image: "${IMAGE}"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    spark.kubernetes.driver.secretKeyRef.POLARIS_CREDENTIAL: "spark-job-polaris:credential"
+    spark.redaction.regex: "(?i)secret|password|token|access[.]?key|credential"
+    # The Service below selects the driver pod by this label.
+    spark.kubernetes.driver.label.lakehouse/role: "connect-server"
+    # --- Spark Connect (the JAR ships with apache/spark 4.x)
+    spark.connect.grpc.binding.port: "15002"
+    # --- sizing for an 8 GB minikube: 1 driver + 1 executor.
+    # The driver holds every client session and collected results.
+    spark.driver.memory: "1g"
+    spark.driver.cores: "1"
+    spark.kubernetes.driver.request.cores: "500m"
+    spark.executor.instances: "1"
+    spark.executor.memory: "1g"
+    spark.executor.cores: "1"
+    spark.kubernetes.executor.request.cores: "500m"
+    spark.sql.shuffle.partitions: "8"
+    spark.sql.session.timeZone: "UTC"
+    # --- Iceberg catalog `lake` -> Polaris catalog `lakehouse` (in-cluster)
+    spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+    spark.sql.catalog.lake: "org.apache.iceberg.spark.SparkCatalog"
+    spark.sql.catalog.lake.type: "rest"
+    spark.sql.catalog.lake.uri: "http://polaris:8181/api/catalog"
+    spark.sql.catalog.lake.warehouse: "lakehouse"
+    spark.sql.catalog.lake.scope: "PRINCIPAL_ROLE:ALL"
+    spark.sql.catalog.lake.token-refresh-enabled: "true"
+    spark.sql.catalog.lake.header.X-Iceberg-Access-Delegation: "vended-credentials"
+    spark.sql.catalog.lake.io-impl: "org.apache.iceberg.aws.s3.S3FileIO"
+    spark.sql.catalog.lake.s3.endpoint: "http://minio:9000"
+    spark.sql.catalog.lake.s3.path-style-access: "true"
+    spark.sql.catalog.lake.client.region: "us-east-1"
+---
+# gRPC endpoint for clients: sc://spark-connect:15002 in the cluster,
+# sc://192.168.49.2:31502 from the laptop.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-connect
+  labels:
+    app.kubernetes.io/part-of: lakehouse-jobs
+spec:
+  type: NodePort
+  selector:
+    lakehouse/role: connect-server
+    spark-role: driver
+  ports:
+    - name: grpc
+      port: 15002
+      targetPort: 15002
+      nodePort: 31502
