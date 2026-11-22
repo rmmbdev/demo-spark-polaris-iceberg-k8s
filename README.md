@@ -13,7 +13,6 @@ short-lived MinIO credentials through MinIO's STS `AssumeRole`.
 | `polaris` | official Apache Polaris chart **1.9.0**, catalog `lakehouse`, credential vending via `storageName: lake` |
 | `spark-operator` | Apache Spark Kubernetes Operator **1.1.0** (Helm chart 1.9.0), CRD `spark.apache.org/v1` |
 | `spark-jobs` image | `apache/spark:4.1.4` + Iceberg 1.12.0 JARs + the job code in `jobs/src` |
-| `trino` | optional: official Trino chart 1.45.0 (Trino 484), to read the same tables from a second engine |
 | `spark-connect` | optional: a long-running `SparkApplication` serving Spark Connect, for Jupyter notebooks |
 
 ## Prerequisites
@@ -23,52 +22,38 @@ short-lived MinIO credentials through MinIO's STS `AssumeRole`.
 | `docker` | minikube driver, and pulling images on the host |
 | `minikube` **1.29+** | `--static-ip` needs 1.29 or newer |
 | `kubectl`, `helm` | deploy everything |
-| `jq` | read Polaris API responses (steps 6, 10, 11) |
+| `jq` | read Polaris API responses (steps 6, 10) |
 | `envsubst` (package `gettext`), `python3` | used by `scripts/submit.sh` |
 | `curl` | download the Iceberg JARs, call Polaris |
-| Java 17 | only for the unit tests on the laptop (step 13) |
-| `uv` | only for the notebook (step 12): installs `pyspark-client` and `jupyterlab` from `pyproject.toml` |
+| Java 17 | only for the unit tests on the laptop (step 12) |
+| `uv` | only for the notebook (step 11): installs `pyspark-client` and `jupyterlab` from `pyproject.toml` |
 
 The Polaris + MinIO part is adapted from
-[demo-iceberg-polaris-multi-catalog-minio](https://github.com/rmmbdev/demo-iceberg-polaris-multi-catalog-minio),
-which runs two catalogs on two MinIO instances and queries them from Trino.
+[demo-iceberg-polaris-multi-catalog-minio](https://github.com/rmmbdev/demo-iceberg-polaris-multi-catalog-minio).
 This repo uses one catalog and focuses on running Spark in the cluster.
 
-Run every command in order, from the repository root. Nothing here has been run
-end to end yet: the Helm values were rendered with `helm template` and the
-`SparkApplication`s validated against the operator's real CRD, but expect to
-fix small things on the first run.
+Run every command in order, from the repository root. Steps 1–8 and the Spark
+Connect server (step 11) have been run on a cluster. The pipeline jobs (steps
+9–10) haven't been run end to end yet, so expect to fix small things there.
 
 ---
 
-## How production ships and runs Spark jobs (read first)
+## How production ships and runs Spark jobs
 
 **Spark jobs are not shipped like Airflow DAGs.** git-sync fits Airflow because
-the scheduler is a long-running process that *keeps re-reading* DAG files. A
-Spark job is a **one-shot** set of pods (driver + executors) created per run
-and then gone. There's nothing long-running to keep in sync, and "whatever
-`main` is right now" would make runs unreproducible.
+its scheduler keeps re-reading DAG files. A Spark job is a **one-shot** set of
+pods, created per run and then gone, and "whatever `main` is right now" would
+make runs unreproducible. So the standard is to **bake the code into an image**
+(Spark + connector JARs + job code) and tag it per change (in production, with
+the git commit). A run refers to an exact tag, so you know what ran, and
+rolling back means using the previous tag. The alternatives, code fetched from
+object storage at start or git-sync as an init container, let code and image
+drift apart.
 
-What teams do instead:
-
-1. **Code baked into an image (the standard, and what this repo does).** The
-   image holds Spark, the connector JARs and the job code. Each change gets a
-   new tag (in production, CI tags it with the git commit). A run refers to an
-   exact tag, so you always know what ran, and rolling back means using the
-   previous tag.
-2. **Code in object storage.** A generic Spark image fetches `job.py` from
-   `s3a://...` at start (common on EMR/Dataproc-style platforms). Cheaper to
-   iterate on, but code and image can drift apart.
-3. **git-sync as an init container.** Possible, but rare: you'd pin a commit
-   anyway, and then option 1 is simpler.
-
-**Submitting is easy:** with an operator, a run is a Kubernetes resource.
-`kubectl create -f run.yaml` and the operator creates the driver, which creates
-the executors. In production an **orchestrator** does this on a schedule: an
-Airflow task (the DAG itself *is* git-synced) renders the `SparkApplication`
-with a unique run name and the current image tag, creates it, waits for its
-state, and fails the task if the job failed. `scripts/submit.sh` does exactly
-that, so you can see the moving parts without Airflow.
+**Submitting is easy:** with an operator, a run is a Kubernetes resource. In
+production an **orchestrator** (an Airflow task) renders the `SparkApplication`
+with a unique run name and the current image tag, creates it, waits, and fails
+the task if the job failed. `scripts/submit.sh` does exactly that.
 
 ```
 git ──► docker build ──► image spark-jobs:<tag> ─┐
@@ -91,7 +76,7 @@ git ──► docker build ──► image spark-jobs:<tag> ─┐
 k8s/
   secrets/      *.env                      → Kubernetes Secrets
   manifests/    postgres.yaml
-  values/       minio.yaml  polaris.yaml  spark-operator.yaml  trino.yaml
+  values/       minio.yaml  polaris.yaml  spark-operator.yaml
   catalogs/     lakehouse.json             → Polaris catalog definition
   spark-apps/   generate-quotes.yaml  quotes-daily.yaml  maintenance.yaml
                                            → SparkApplication templates
@@ -101,7 +86,7 @@ jobs/
   src/lakehouse/
     spark.py         SparkSession (catalog config comes from the SparkApplication)
     transforms.py    pure DataFrame → DataFrame functions (unit-tested)
-    jobs/            entrypoints: generate_quotes, quotes_daily, maintenance
+    jobs/            entrypoints: generate_quotes, quotes_daily, maintenance, connect_server
   tests/        pytest, no cluster needed
 scripts/
   submit.sh     render a template, create the run, wait for the result
@@ -129,7 +114,6 @@ from pods. Polaris itself uses `endpointInternal` (`http://minio:9000`).
 | Polaris REST + management | `http://polaris:8181` | `http://192.168.49.2:30181` |
 | MinIO S3 API | `http://minio:9000` | `http://192.168.49.2:30900` |
 | MinIO console | | `http://192.168.49.2:30901` (`minioadmin` / `minioadmin`) |
-| Trino (optional) | `http://trino:8080` | `http://192.168.49.2:30808` |
 | Spark Connect (optional) | `sc://spark-connect:15002` | `sc://192.168.49.2:31502` |
 | Spark UI of a running driver | | `kubectl port-forward` (step 10) |
 
@@ -140,7 +124,6 @@ from pods. Polaris itself uses `endpointInternal` (`http://minio:9000`).
 | Postgres + MinIO + Polaris | ~2.5 GB |
 | spark-operator | 1 GB |
 | One job run: driver + 1 executor (1g heap + overhead each) | ~2.8 GB |
-| Trino (optional) | ~3 GB, so scale it to 0 before running jobs |
 | Spark Connect server (optional): driver + 1 executor, always on | ~2.8 GB, so delete it before running jobs |
 
 ---
@@ -148,22 +131,9 @@ from pods. Polaris itself uses `endpointInternal` (`http://minio:9000`).
 ## 1. Helm repositories
 
 ```bash
-  helm repo add polaris https://downloads.apache.org/polaris/helm-chart
-```
-
-```bash
-  helm repo add minio https://charts.min.io/
-```
-
-```bash
-  helm repo add spark https://apache.github.io/spark-kubernetes-operator
-```
-
-```bash
-  helm repo add trino https://trinodb.github.io/charts
-```
-
-```bash
+  helm repo add polaris https://downloads.apache.org/polaris/helm-chart && \
+  helm repo add minio https://charts.min.io/ && \
+  helm repo add spark https://apache.github.io/spark-kubernetes-operator && \
   helm repo update
 ```
 
@@ -218,15 +188,9 @@ command).
 ## 4. Postgres and MinIO
 
 ```bash
-  kubectl apply -f k8s/manifests/postgres.yaml
-```
-
-```bash
+  kubectl apply -f k8s/manifests/postgres.yaml && \
   helm upgrade --install minio minio/minio --version 5.4.0 \
-    --values k8s/values/minio.yaml --timeout 10m
-```
-
-```bash
+    --values k8s/values/minio.yaml --timeout 10m && \
   kubectl wait --for=condition=available deploy/postgres deploy/minio --timeout=300s
 ```
 
@@ -265,10 +229,7 @@ that the output ends with `Bootstrap completed successfully.`:
 
 ```bash
   helm upgrade --install polaris polaris/polaris --version 1.9.0 \
-    --values k8s/values/polaris.yaml --timeout 10m
-```
-
-```bash
+    --values k8s/values/polaris.yaml --timeout 10m && \
   kubectl rollout status deploy/polaris --timeout=600s
 ```
 
@@ -280,28 +241,23 @@ that the output ends with `Bootstrap completed successfully.`:
 
 ## 6. Catalog and principals
 
-```bash
-  export POLARIS=http://192.168.49.2:30181
-```
+`TOKEN` expires after an hour and is gone in a new terminal: rerun this block
+when you need it again.
 
 ```bash
+  export POLARIS=http://192.168.49.2:30181 && \
   export TOKEN=$(curl -s -X POST $POLARIS/api/catalog/v1/oauth/tokens \
     -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
     | jq -r '.access_token')
 ```
 
-The catalog:
+The catalog. Creating it also creates its `catalog_admin` role, which can only
+manage access at first, so the second call lets it manage content:
 
 ```bash
   curl -X POST $POLARIS/api/management/v1/catalogs \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d @k8s/catalogs/lakehouse.json
-```
-
-Creating a catalog also creates its `catalog_admin` role, which can only manage
-access at first. Let it manage content:
-
-```bash
+    -d @k8s/catalogs/lakehouse.json && \
   curl -X PUT $POLARIS/api/management/v1/catalogs/lakehouse/catalog-roles/catalog_admin/grants \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}'
@@ -318,21 +274,17 @@ straight into a file (git-ignored):
     > k8s/secrets/spark-job.credential
 ```
 
-The chain **principal → principal role → catalog role → privilege**:
+The chain **principal → principal role → catalog role → privilege**: create
+the principal role `data_engineer`, give it the catalog role, give it to
+`spark-job`:
 
 ```bash
   curl -X POST $POLARIS/api/management/v1/principal-roles \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"principalRole": {"name": "data_engineer"}}'
-```
-
-```bash
+    -d '{"principalRole": {"name": "data_engineer"}}' && \
   curl -X PUT $POLARIS/api/management/v1/principal-roles/data_engineer/catalog-roles/lakehouse \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"catalogRole": {"name": "catalog_admin"}}'
-```
-
-```bash
+    -d '{"catalogRole": {"name": "catalog_admin"}}' && \
   curl -X PUT $POLARIS/api/management/v1/principals/spark-job/principal-roles \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"principalRole": {"name": "data_engineer"}}'
@@ -350,10 +302,7 @@ trailing newline (`--from-file` would keep it, and Polaris would answer `401`):
 
 ```bash
   helm upgrade --install spark-operator spark/spark-kubernetes-operator \
-    --version 1.9.0 --values k8s/values/spark-operator.yaml
-```
-
-```bash
+    --version 1.9.0 --values k8s/values/spark-operator.yaml && \
   kubectl rollout status deploy/spark-kubernetes-operator --timeout=300s
 ```
 
@@ -380,11 +329,7 @@ Download the Iceberg JARs that get baked into the image (git-ignored):
 Build **inside** minikube, so the cluster has the image without a registry:
 
 ```bash
-  minikube image build -t spark-jobs:0.1 jobs
-```
-
-```bash
-  minikube image ls | grep spark-jobs
+  minikube image build -t spark-jobs:0.1 jobs && minikube image ls | grep spark-jobs
 ```
 
 **Bump the tag for every change** (`0.2`, `0.3`, ...) and pass it to
@@ -403,20 +348,15 @@ state transitions and exits non-zero if the job failed, as an Airflow task
 would.
 
 **Bronze:** generate 2M synthetic quotes over 7 days. Pods can't see files on
-your laptop, so the source data is created in the cluster:
+your laptop, so the source data is created in the cluster. **Silver:** load one
+day:
 
 ```bash
-  scripts/submit.sh generate-quotes --rows 2000000 --start-day 2026-08-01 --days 7
-```
-
-**Silver:** load one day:
-
-```bash
+  scripts/submit.sh generate-quotes --rows 2000000 --start-day 2026-08-01 --days 7 && \
   scripts/submit.sh quotes-daily --day 2026-08-02
 ```
 
-Typical output (illustrative: the state names come from the operator's CRD,
-timings and the exact sequence will differ):
+Typical output (illustrative: timings and the exact sequence will differ):
 
 ```
 submitted quotes-daily-20261120-101500 with image spark-jobs:0.1
@@ -429,8 +369,7 @@ submitted quotes-daily-20261120-101500 with image spark-jobs:0.1
 quotes-daily-20261120-101500: SUCCEEDED
 ```
 
-The job's own output (the driver pod is `<run>-0-driver`; if yours differs,
-take it from `kubectl get pods -l spark-role=driver`):
+The job's own output, from the latest driver pod (`<run>-0-driver`):
 
 ```bash
   kubectl logs $(kubectl get pods -l spark-role=driver --sort-by=.metadata.creationTimestamp -o name | tail -1) | grep -A6 loaded
@@ -462,26 +401,16 @@ that's why production jobs also need guards that fail loudly.
 nightly routine of a lakehouse team:
 
 ```bash
-  for d in 2026-08-03 2026-08-04 2026-08-05; do scripts/submit.sh quotes-daily --day $d; done
-```
-
-```bash
+  for d in 2026-08-03 2026-08-04 2026-08-05; do scripts/submit.sh quotes-daily --day $d; done && \
   scripts/submit.sh maintenance --table silver.quotes_daily --retain-last 3
 ```
 
 **The Spark UI of a job in the cluster.** The UI lives in the driver pod and
-dies with it. Keep the driver alive for 5 minutes with `--linger`, without
-waiting in the terminal:
+dies with it. Keep the driver alive for 5 minutes with `--linger`, wait until
+the run shows `RunningHealthy` (Ctrl+C to stop watching), then forward its port:
 
 ```bash
-  WAIT=0 scripts/submit.sh quotes-daily --day 2026-08-06 --linger 300
-```
-
-Wait until the run shows `RunningHealthy` (Ctrl+C to stop watching), so the
-driver pod exists:
-
-```bash
-  kubectl get sparkapp -w
+  WAIT=0 scripts/submit.sh quotes-daily --day 2026-08-06 --linger 300 && kubectl get sparkapp -w
 ```
 
 ```bash
@@ -495,8 +424,7 @@ History Server instead, which reads event logs from object storage after the
 pods are gone.
 
 **Where the commit pointer lives.** Load the table over Polaris's REST API as
-`spark-job`, the way Spark does (in a new terminal, run
-`export POLARIS=http://192.168.49.2:30181` first):
+`spark-job`, the way Spark does (`POLARIS` from step 6):
 
 ```bash
   ID=$(cut -d: -f1 k8s/secrets/spark-job.credential); SECRET=$(cut -d: -f2 k8s/secrets/spark-job.credential); \
@@ -507,92 +435,28 @@ pods are gone.
 ```
 
 **Run history.** Runs stay as resources (with their pods, thanks to
-`resourceRetainPolicy: Always`) until `ttlAfterStopMillis` (1 day) removes them:
+`resourceRetainPolicy: Always`) until `ttlAfterStopMillis` (1 day) removes
+them. Inspect one with `kubectl describe sparkapp <run-name>`:
 
 ```bash
   kubectl get sparkapp -l app.kubernetes.io/part-of=lakehouse-jobs
 ```
 
-```bash
-  kubectl describe sparkapp <run-name>
-```
+## 11. Optional: Jupyter over Spark Connect
 
-## 11. Optional: the same tables from Trino
+A notebook needs a Spark session that **stays up**, unlike the batch runs
+above. **Spark Connect** (part of Spark 4) does that: a long-running driver
+serves gRPC on port `15002`, and the notebook is a thin client with no JVM or
+JARs. The server is just another `SparkApplication`, started by
+`lakehouse/jobs/connect_server.py` from the step 8 image, and it reads the
+Polaris credential from the same Secret as the jobs, so notebooks never see it.
 
-Scale the operator down first if memory is tight
-(`kubectl scale deploy/spark-kubernetes-operator --replicas=0`).
-
-```bash
-  docker pull trinodb/trino:484 && minikube image load trinodb/trino:484
-```
-
-A principal for Trino, with the same role. `TOKEN` from step 6 expires after an
-hour, and is gone in a new terminal: rerun the two `export` commands of step 6
-first.
+It needs as much memory as a job run, so on 8 GB delete it before `submit.sh`
+runs. Create it, wait for `RunningHealthy` (Ctrl+C to stop watching), and check
+that it's listening:
 
 ```bash
-  curl -s -X POST $POLARIS/api/management/v1/principals \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"principal": {"name": "trino-svc", "type": "SERVICE"}}' \
-    | jq -r '.credentials.clientId + ":" + .credentials.clientSecret' \
-    > k8s/secrets/trino-svc.credential
-```
-
-```bash
-  curl -X PUT $POLARIS/api/management/v1/principals/trino-svc/principal-roles \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"principalRole": {"name": "data_engineer"}}'
-```
-
-```bash
-  kubectl create secret generic trino-secrets \
-    --from-literal=POLARIS_AUTH="$(cat k8s/secrets/trino-svc.credential)" \
-    --from-literal=S3_ACCESS_KEY=lake-user \
-    --from-literal=S3_SECRET_KEY=lake-secret-0123456789
-```
-
-```bash
-  helm upgrade --install trino trino/trino --version 1.45.0 \
-    --values k8s/values/trino.yaml --timeout 10m
-```
-
-```bash
-  kubectl rollout status deploy/trino-coordinator --timeout=600s
-```
-
-```bash
-  kubectl exec -it deploy/trino-coordinator -- trino --server localhost:8080 --user admin \
-    --execute 'SELECT CAST(created_at AS date) AS day, count(*) AS quotes FROM lake.silver.quotes_daily GROUP BY 1 ORDER BY 1'
-```
-
-Same rows Spark wrote: two engines, one catalog, no copy.
-
-## 12. Optional: Jupyter over Spark Connect
-
-The jobs above are batch runs: the driver exits and the pods go away. A notebook
-needs a Spark session that **stays up**. Spark 4 ships **Spark Connect**, a
-client-server protocol: a long-running driver serves gRPC on port `15002`, and
-the notebook is a thin client (no JVM, no JARs on the laptop). The server is
-just another `SparkApplication`, so the operator runs it, and it gets the
-Polaris credential from the same Secret as the jobs. Notebooks never see it.
-
-The server's launcher (`lakehouse/jobs/connect_server.py`) is in the image, so
-build a new tag first (step 8):
-
-```bash
-  minikube image build -t spark-jobs:0.2 jobs
-```
-
-It needs the same memory as a job run. Don't run both at once on 8 GB: scale
-Trino to 0, and delete the server before `submit.sh` runs.
-
-```bash
-  IMAGE=spark-jobs:0.2 envsubst '${IMAGE}' < k8s/connect/spark-connect.yaml | kubectl apply -f -
-```
-
-Wait for `RunningHealthy` (Ctrl+C to stop watching), then check the log line:
-
-```bash
+  IMAGE=spark-jobs:0.1 envsubst '${IMAGE}' < k8s/connect/spark-connect.yaml | kubectl apply -f - && \
   kubectl get sparkapp spark-connect -w
 ```
 
@@ -600,59 +464,38 @@ Wait for `RunningHealthy` (Ctrl+C to stop watching), then check the log line:
   kubectl logs -l lakehouse/role=connect-server,spark-role=driver --tail=50 | grep "Spark Connect server listening"
 ```
 
-The client on the laptop is the root `pyproject.toml`, managed with
-[uv](https://docs.astral.sh/uv/). It pins `pyspark-client==4.1.4`, which must
-match the server's Spark version, and `jupyterlab`. `uv sync` creates `.venv`
-with the Python in `.python-version` (3.13) and installs the locked versions
-from `uv.lock`:
+The client is the root `pyproject.toml`, managed with
+[uv](https://docs.astral.sh/uv/): `pyspark-client==4.1.4` (must match the
+server) and `jupyterlab`, on Python 3.13:
 
 ```bash
-  uv sync
+  uv sync && uv run jupyter lab notebooks/sample.ipynb
 ```
 
-```bash
-  uv run jupyter lab notebooks/sample.ipynb
-```
+The notebook connects to `sc://192.168.49.2:31502` and queries
+`lake.silver.quotes_daily` with SQL, the DataFrame API and Iceberg's metadata
+tables. Python UDFs would run in the executors' Python 3.10, so they fail from
+the notebook's 3.13. SQL and DataFrame code is unaffected.
 
-The notebook connects with `SparkSession.builder.remote("sc://192.168.49.2:31502")`,
-lists the catalog, queries `lake.silver.quotes_daily` with SQL and the
-DataFrame API, reads Iceberg's `snapshots` metadata table, and hands a small
-result to pandas. `spark.stop()` in the notebook closes only that client
-session.
-
-Python UDFs from the notebook run in the executors' Python (3.10 in
-`apache/spark:4.1.4`), so they fail from the notebook's Python 3.13. SQL and
-DataFrame code is unaffected.
-
-The operator doesn't roll a running app when its spec changes. To change the
-server (a new image tag, more memory), delete it and apply again. Delete it
-when you're done, to free the memory:
+The operator doesn't roll a running app when its spec changes: to change the
+server (new image tag, more memory), delete it and apply again. Delete it when
+you're done:
 
 ```bash
   kubectl delete sparkapp spark-connect
 ```
 
-## 13. Unit tests (on the laptop, no cluster)
+## 12. Unit tests (on the laptop, no cluster)
 
 Needs Java 17 and Python 3.10+. Spark 4.1 doesn't run on newer JDKs such as
 Java 25; install 17 next to it (Manjaro/Arch: `sudo pacman -S jdk17-openjdk`)
-without changing the system default. The commands below run inside `jobs/`.
-
-```bash
-  cd jobs && python -m venv .venv && . .venv/bin/activate && pip install ".[dev]"
-```
-
-```bash
-  JAVA_HOME=/usr/lib/jvm/java-17-openjdk pytest -q
-```
-
-```bash
-  ruff check src tests
-```
-
-The transforms in `jobs/src/lakehouse/transforms.py` are pure
+without changing the system default. The transforms are pure
 `DataFrame → DataFrame` functions, so they're tested on a few in-memory rows.
-The jobs only wire them to reads and writes.
+
+```bash
+  cd jobs && python -m venv .venv && . .venv/bin/activate && pip install ".[dev]" && \
+  JAVA_HOME=/usr/lib/jvm/java-17-openjdk pytest -q && ruff check src tests
+```
 
 ## Troubleshooting
 
@@ -665,19 +508,17 @@ The jobs only wire them to reads and writes.
 | Bootstrap: `no schema has been selected to create in` | Schema `polaris_schema` missing: create it (step 5) and rerun bootstrap |
 | Token is `null` right after setup | Bootstrap failed, so there's no `root` principal: rerun step 5 and check for `Bootstrap completed successfully.` |
 | Token is `null` / `403` from management calls | Wrong root credential, or `TOKEN` older than an hour |
-| Run stays `Submitted` / ends `DriverStartTimedOut` | Not enough memory to schedule the driver: `kubectl describe pod <driver>`; scale Trino down |
+| Run stays `Submitted` / ends `DriverStartTimedOut` | Not enough memory to schedule the driver: `kubectl describe pod <driver>`; delete `spark-connect` if it runs |
 | `pods is forbidden` in the driver log | Driver not running as the `spark` service account |
 | `KeyError` / `401` / `NotAuthorizedException` | Secret `spark-job-polaris` missing, wrong key, or created with `--from-file` |
 | `ForbiddenException` from Polaris | `spark-job` lacks the `data_engineer` role chain (step 6) |
 | `403` / `AccessDenied` from S3 | Vending problem: `kubectl logs deploy/polaris \| grep -i -E "sts\|assume"`; check `lake-user` has `warehouse-rw` |
 | `kubectl create` says the run already exists | Two submits in the same second; run again |
-| `ModuleNotFoundError: lakehouse` in the driver log | Image built from an old Dockerfile; rebuild with a new tag (step 8) |
+| `ModuleNotFoundError` in the driver log | Image built from older code; rebuild with a new tag (step 8) |
 | `submit.sh`: `envsubst: command not found` | Install `gettext` |
 | Code change has no effect | Image tag reused with `IfNotPresent`: build a new tag and pass `TAG=` |
 | Notebook: `failed to connect to all addresses` | Server not `RunningHealthy` yet, or the Service has no endpoint: `kubectl get endpoints spark-connect` |
 | Notebook: version mismatch errors | `pyspark-client` version differs from the server (4.1.4) |
-| `spark-connect` driver exits: `No module named ...connect_server` | Image built before step 12: build a new tag and apply with it |
-| Jobs stuck in `Submitted` while the server runs | Not enough memory for both: `kubectl delete sparkapp spark-connect` |
 
 ## Teardown
 
